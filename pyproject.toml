@@ -1,0 +1,35 @@
+[project]
+name = "mlteam"
+version = "0.1.0"
+description = "An AutoML team you steer from the terminal: agents do the work, the harness sets the rules, you decide at the gates."
+requires-python = ">=3.13"
+readme = "README.md"
+dependencies = [
+    "duckdb>=2.0.0",
+    "kagglehub>=1.0.3",
+    "optuna>=5.0.0",
+    "scikit-learn==1.7.2",
+    "tau-ai==0.4.10",
+    "textual>=8.2,<9",
+]
+
+[project.urls]
+Repository = "https://github.com/MonishGosar/automl-team"
+
+[project.scripts]
+mlteam = "mlteam.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
