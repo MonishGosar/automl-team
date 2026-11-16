@@ -354,6 +354,10 @@ The full list, with reasons, is in [docs/GUIDE.md](docs/GUIDE.md#limits-so-far).
 - A guided "learn" mode that walks through each decision
 - Forecasting and text features
 
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
+
 ## Acknowledgements
 
 - [Tau](https://github.com/huggingface/tau) for the agent loop and provider layer

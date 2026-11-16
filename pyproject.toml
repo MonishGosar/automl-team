@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "An AutoML team you steer from the terminal: agents do the work, the harness sets the rules, you decide at the gates."
 requires-python = ">=3.13"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
     "duckdb>=2.0.0",
     "kagglehub>=1.0.3",
