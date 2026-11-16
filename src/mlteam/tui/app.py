@@ -178,7 +178,9 @@ class MLTeamApp(App[None]):
     #dedupe { margin-top: 1; }
     .costs { height: auto; }
     .costs Input { width: 1fr; }
-    #buttons { height: auto; padding: 1 1 0 1; border-top: solid $panel; }
+    .feedback { height: auto; padding: 1 1 0 1; border-top: solid $panel; }
+    .feedback Input { width: 1fr; margin-right: 2; }
+    #buttons { height: auto; padding: 1 1 0 1; }
     #buttons Button { margin-right: 2; }
     #approve_hint { width: 1fr; height: 3; content-align: left middle; color: $text-muted; }
     #features_body { height: 1fr; }
@@ -187,7 +189,7 @@ class MLTeamApp(App[None]):
     #feature_list { height: 1fr; }
     #feat_right { width: 2fr; padding: 0 1 1 2; border-left: solid $panel; }
     #feat_right Static { height: auto; margin-bottom: 1; }
-    #feat_buttons { height: auto; padding: 1 1 0 1; border-top: solid $panel; }
+    #feat_buttons { height: auto; padding: 1 1 0 1; }
     #feat_buttons Button { margin-right: 2; }
     #feat_hint { width: 1fr; height: 3; content-align: left middle; color: $text-muted; }
     #tune_label { width: auto; height: 3; content-align: right middle; color: $text-muted; padding-right: 1; }
@@ -199,7 +201,7 @@ class MLTeamApp(App[None]):
     #prediction { height: auto; max-height: 14; padding-top: 1; }
     #model_right { width: 2fr; padding: 0 1 1 2; border-left: solid $panel; }
     #model_right Static { height: auto; margin-bottom: 1; }
-    #model_buttons { height: auto; padding: 1 1 0 1; border-top: solid $panel; }
+    #model_buttons { height: auto; padding: 1 1 0 1; }
     #model_buttons Button { margin-right: 2; }
     #model_hint { width: 1fr; height: 3; content-align: left middle; color: $text-muted; }
     #insights_scroll { padding: 1 2; }
@@ -246,8 +248,10 @@ class MLTeamApp(App[None]):
         fetch_kaggle: KaggleFetcher = fetch_from_kaggle,
         tune_budget: Budget | None = None,
         test_seconds: float = 30.0,
+        resume: Path | None = None,
     ) -> None:
         super().__init__()
+        self._resume = resume
         self._tune_budget = tune_budget if tune_budget is not None else Budget()
         self._test_seconds = test_seconds
         self._sources = sources or []
@@ -341,6 +345,9 @@ class MLTeamApp(App[None]):
                             yield Static(id="reasons")
                             yield Static(id="review")
                             yield Static(render.learn(), id="learn")
+                    with Horizontal(classes="feedback"):
+                        yield Input(id="fb_contract", placeholder="Feedback for the agents, e.g. 'also try a ratio of visits to tickets'. Enter or Redo.", compact=True)
+                        yield Button("Redo with feedback", id="redo_contract", compact=True)
                     with Horizontal(id="buttons"):
                         yield Button("Approve contract", id="approve", variant="success", disabled=True)
                         yield Button("Reset to proposal", id="reset")
@@ -359,6 +366,9 @@ class MLTeamApp(App[None]):
                             yield Static(render.feature_detail(None), id="feat_detail")
                             yield Static(id="feat_review")
                             yield Static(render.learn_features(), id="feat_learn")
+                    with Horizontal(classes="feedback"):
+                        yield Input(id="fb_features", placeholder="Feedback for the agents, e.g. 'also try a ratio of visits to tickets'. Enter or Redo.", compact=True)
+                        yield Button("Redo with feedback", id="redo_features", compact=True)
                     with Horizontal(id="feat_buttons"):
                         yield Button("Approve features", id="approve_features", variant="success", disabled=True)
                         yield Static("tuning budget, seconds", id="tune_label")
@@ -376,6 +386,11 @@ class MLTeamApp(App[None]):
                             yield Static(render.model_detail(None, None), id="model_detail")
                             yield Static(id="model_review")
                             yield Static(render.learn_models(), id="model_learn")
+                    with Horizontal(classes="feedback"):
+                        yield Input(id="fb_models", compact=True,
+                                    placeholder="Feedback for the model plan, e.g. 'try deeper forests, "
+                                                "skip linear'. Enter or Redo.")
+                        yield Button("Redo with feedback", id="redo_models", compact=True)
                     with Horizontal(id="model_buttons"):
                         yield Button("Approve this model", id="approve_model", variant="success", disabled=True)
                         yield Static("move to a model · ctrl+s approves it", id="model_hint")
@@ -402,7 +417,9 @@ class MLTeamApp(App[None]):
         )
         self._refresh_rail()
         self._refresh_status()
-        if self._sources:
+        if self._resume is not None:
+            self.resume_pipeline(self._resume)
+        elif self._sources:
             self.run_pipeline(self._sources)
         else:
             self._ask_for_source()
@@ -471,6 +488,120 @@ class MLTeamApp(App[None]):
         self.proposal = copy.deepcopy(self.team.contract)
         await self._load_form(self.team.contract, new_base=True)
         self.query_one("#main", TabbedContent).active = "contract"
+
+    @work(exclusive=True, group="pipeline")
+    async def resume_pipeline(self, root: Path) -> None:
+        """Open a run where it stopped: every tab filled in from what was saved."""
+        try:
+            self.team = await asyncio.to_thread(
+                Team.resume, root, brain=self._brain, brain_note=self._brain_note, stats_only=self._stats_only,
+                emit=self.on_team_event, fetch_kaggle=self._fetch_kaggle,
+                tune_budget=Budget(**vars(self._tune_budget)), test_seconds=self._test_seconds,
+            )
+        except (ValueError, StoreError, OSError) as exc:
+            self._ask_for_source(f"Could not resume {root}: {exc}")
+            return
+        team = self.team
+        self._show_tables()
+        assert team.contract is not None
+        self.proposal = copy.deepcopy(team.draft or team.contract)
+        await self._load_form(team.contract, new_base=True)
+        if team.status.get("gate") == "done":
+            self.query_one("#approve", Button).label = f"Approved v{team.contract.version} · approve again"
+        self._refresh_rail()
+        self._refresh_status()
+        if team.status.get("gate") != "done":
+            self.query_one("#main", TabbedContent).active = "contract"
+        elif team.status.get("feature_gate") not in {"waiting", "done"} or not team.features:
+            self.run_features()
+        else:
+            self._show_features()
+            self.query_one("#insights_view", Static).update(render.insights_view(team.insights, self._contract_note()))
+            if team.feature_set is not None and team.status.get("feature_gate") == "done":
+                self.query_one("#approve_features", Button).label = f"Approved v{team.feature_set.version}"
+            if team.status.get("feature_gate") != "done":
+                self.query_one("#main", TabbedContent).active = "features"
+            elif team.training is None:
+                self.run_training()
+            else:
+                self._show_models()
+                self._refresh_monitor()
+                self.query_one("#main", TabbedContent).active = (
+                    "monitor" if team.status.get("model_gate") == "done" else "models")
+        self.notify(f"Picked up at {team.where()}.", title=f"Resumed {team.run.run_id}", timeout=8)
+
+    # -- feedback --------------------------------------------------------
+
+    @on(Button.Pressed, "#redo_contract")
+    @on(Input.Submitted, "#fb_contract")
+    def redo_contract_pressed(self) -> None:
+        self._redo("contract", "#fb_contract")
+
+    @on(Button.Pressed, "#redo_features")
+    @on(Input.Submitted, "#fb_features")
+    def redo_features_pressed(self) -> None:
+        self._redo("features", "#fb_features")
+
+    @on(Button.Pressed, "#redo_models")
+    @on(Input.Submitted, "#fb_models")
+    def redo_models_pressed(self) -> None:
+        self._redo("models", "#fb_models")
+
+    def _redo(self, step: str, field: str) -> None:
+        box = self.query_one(field, Input)
+        text = box.value.strip()
+        if self.team is None:
+            return
+        if not text:
+            self.notify("Write what you want changed first.", severity="warning")
+            return
+        ready = {"contract": self.team.status.get("gate") in {"waiting", "done"},
+                 "features": self.team.status.get("feature_gate") in {"waiting", "done"},
+                 "models": self.team.status.get("model_gate") in {"waiting", "done"}}[step]
+        if not ready:
+            self.notify("That step has not reached its gate yet.", severity="warning")
+            return
+        box.value = ""
+        self.redo_step(step, text)
+
+    @work(exclusive=True, group="redo")
+    async def redo_step(self, step: str, text: str) -> None:
+        assert self.team is not None
+        if self.team.brain is None:
+            self.notify("No model is connected, so only the rules run again. Run `tau`, then /login, for agents.",
+                        severity="warning", timeout=8)
+        if step == "contract":
+            self._clear_features("Approve the data contract first. Features are built from it.")
+            self._clear_models("Approve the features first. Models are trained on them.")
+            await self.team.redo("contract", text)
+            assert self.team.contract is not None
+            self.proposal = copy.deepcopy(self.team.contract)
+            await self._load_form(self.team.contract, new_base=True)
+            self.query_one("#approve", Button).label = "Approve contract"
+            self.query_one("#main", TabbedContent).active = "contract"
+        elif step == "features":
+            self._clear_features("The Engineer is redoing the features with your feedback...")
+            self._clear_models("Approve the features first. Models are trained on them.")
+            try:
+                await self.team.redo("features", text)
+            except (ValueError, StoreError) as exc:
+                self._clear_features(f"Features could not be built: {exc}")
+                return
+            self._show_features()
+            self.query_one("#insights_view", Static).update(
+                render.insights_view(self.team.insights, self._contract_note()))
+            self.query_one("#main", TabbedContent).active = "features"
+        else:
+            self._clear_models("Redoing the model plan with your feedback...")
+            try:
+                await self.team.redo("models", text)
+            except (ValueError, StoreError) as exc:
+                self._clear_models(f"Training could not run: {exc}")
+                return
+            self._show_models()
+            self.query_one("#main", TabbedContent).active = "models"
+        self._refresh_rail()
+        self._refresh_status()
 
     def on_team_event(self, event: TeamEvent) -> None:
         """Called by the harness. May arrive from a worker thread."""

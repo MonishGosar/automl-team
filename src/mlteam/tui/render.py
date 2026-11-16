@@ -93,8 +93,9 @@ def rail(status: dict[str, str], notes: dict[str, str] | None = None) -> Text:
         text.append("\n")
     text.append(" " + "─" * 18 + "\n", style="dim")
     for label in LOCKED_STAGES:
-        text.append(f" · {label}\n", style="dim")
-    text.append(" not built yet\n", style="dim italic")
+        ready = status.get("model_gate") == "done"
+        text.append(f" {'◆' if ready else '·'} {label}\n", style="cyan" if ready else "dim")
+        text.append("   mlteam serve <run>\n" if ready else "   after a model is approved\n", style="dim italic")
     return text
 
 
@@ -751,7 +752,8 @@ def prediction(result: Prediction | None, skipped: str = "") -> Text:
     return text
 
 
-STATUS_STYLE_HEALTH = {"stable": "bold green", "watch": "bold yellow", "retrain": "bold red"}
+STATUS_STYLE_HEALTH = {"stable": "bold green", "watch": "bold yellow", "retrain": "bold red",
+                       "too few rows": "dim"}
 
 
 def _psi_style(value: float) -> str:

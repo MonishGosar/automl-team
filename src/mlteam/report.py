@@ -127,6 +127,12 @@ def build_report(team: Any) -> str:
     for question, answer in contract.answers.items():
         decided.append(f"<b>Asked:</b> {escape(question)}<br><b>Answer:</b> {escape(answer)}")
     parts.append(_li(decided))
+    feedback = getattr(team, "feedback", None) or []
+    if feedback:
+        step = {"analyst": "contract", "engineer": "features", "train_plan": "models"}
+        parts.append("<p><b>Feedback given to the agents:</b></p>" + _li(
+            [f"<span class='muted'>{escape(str(f.get('at', ''))[:16])} · {escape(step.get(f.get('stage', ''), ''))}"
+             f"</span> {escape(f.get('text', ''))}" for f in feedback]))
     if contract.leakage_suspects:
         parts.append("<p><b>Possible leaks checked:</b></p>" + _li(
             [f"{escape(s.column)}: {escape(s.reason)}" for s in contract.leakage_suspects]))

@@ -102,6 +102,11 @@ class RunPaths:
         return self.root / f"model.v{version}.json"
 
     @property
+    def state(self) -> Path:
+        """Where the run stopped: stage statuses, the open proposals and reviews."""
+        return self.root / "state.json"
+
+    @property
     def monitoring(self) -> Path:
         return self.root / "monitoring.jsonl"
 

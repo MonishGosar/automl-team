@@ -6,7 +6,8 @@ agent brain (`tau_agent`) with its own Textual interface.
 
 Built so far: data intake, three gates (data contract, features, model), feature tests,
 budgeted Bayesian tuning, scoring, drift monitoring, and champion/challenger retraining.
-Serving predictions over a network is shown in the pipeline as locked.
+The approved model can be served over HTTP (`mlteam serve`), a run can be paused and
+resumed at any gate (`mlteam resume`), and every gate takes feedback for its agents.
 
 ```text
 intake -> load -> profile -> draft -> Analyst -> Skeptic -> [you] data contract
@@ -455,8 +456,8 @@ Data (intake, store, profile,     DuckDB, sealed read-only before any agent touc
   data, scores move by several points by chance, and the harness says so.
 - The approved model is the one fitted on training rows only. It is not refitted on all
   rows before scoring the test file.
-- New files are scored on request, one at a time. Serving predictions over a network
-  is not built.
+- `mlteam serve` is a small standard-library HTTP server with no authentication; it
+  scores one request at a time.
 - New rows are matched to the run's own copies of joined tables. If those tables have
   grown since, add the new data as a new run.
 - Tuning is not cost-aware within a family: a slow setting costs budget like a fast

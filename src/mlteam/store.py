@@ -83,6 +83,18 @@ class Store:
         self._sealed = False
         self._con = duckdb.connect(str(db_path))
 
+    @classmethod
+    def open_sealed(cls, db_path: Path) -> Store:
+        """An existing run's database, opened read-only and sealed from the start."""
+        store = cls.__new__(cls)
+        store._path = db_path
+        store._lock = threading.RLock()
+        store._con = duckdb.connect(str(db_path), read_only=True)
+        store._con.execute("SET enable_external_access = false")
+        store._con.execute("SET lock_configuration = true")
+        store._sealed = True
+        return store
+
     # -- loading ---------------------------------------------------------
 
     def load(self, manifest: Manifest, run: RunPaths) -> list[TableInfo]:

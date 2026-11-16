@@ -17,6 +17,7 @@ import json
 from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from mlteam.agents.brain import Brain
 from mlteam.agents.roles import (
@@ -46,6 +47,7 @@ from mlteam.agents.roles import (
 from mlteam.agents.tools import Review, TeamContext
 from mlteam.contract import (
     QUESTIONS_FIELD,
+    contract_from_json,
     DataContract,
     Issue,
     has_errors,
@@ -143,6 +145,8 @@ class Team:
         self.model_card: dict[str, object] | None = None
         self.report_path: Path | None = None
         self.prediction: Prediction | None = None
+        # What the person said back to the agents, oldest first: {stage, text, at}.
+        self.feedback: list[dict[str, str]] = []
 
     # -- events ----------------------------------------------------------
 
@@ -154,6 +158,150 @@ class Team:
     def _set(self, stage: str, status: str, text: str = "") -> None:
         self.status[stage] = status
         self.emit(TeamEvent("stage", stage=stage, text=text, data={"status": status}))
+        if stage in GATES or stage == "predict":
+            self._checkpoint()
+
+    # -- pause and resume ------------------------------------------------
+
+    def _checkpoint(self) -> None:
+        """Save where the run stands, so it can be picked up later. Written whenever a
+        gate opens or closes; approved artefacts are saved separately and are the truth."""
+        try:
+            write_json(self.run.state, {
+                "saved_at": now_iso(),
+                "status": self.status,
+                "draft": self.draft.to_json() if self.draft else None,
+                "contract": self.contract.to_json() if self.contract else None,
+                "review": asdict(self.review) if self.review else None,
+                "feature_review": asdict(self.feature_review) if self.feature_review else None,
+                "model_review": asdict(self.model_review) if self.model_review else None,
+                "features": [asdict(f) for f in self.features],
+                "candidates": [asdict(c) for c in self.candidates],
+                "feedback": self.feedback,
+            })
+        except Exception as exc:  # noqa: BLE001 - a checkpoint must never break the run
+            self._trace.log("checkpoint_failed", error=str(exc))
+
+    @classmethod
+    def resume(cls, root: Path, **kwargs: Any) -> Team:
+        """Pick a run up where it stopped: at its last open gate, with its proposals,
+        reviews, scores and approvals as they were. A stage that was cut off while
+        running starts again from the gate before it."""
+        from mlteam.restore import from_dict
+
+        run = RunPaths(Path(root))
+        if not run.manifest.exists():
+            raise ValueError(f"{root} is not a run folder (no manifest.json).")
+        if not run.db.exists() or not run.profile.exists():
+            raise ValueError("This run stopped before its data was loaded. Start a new run instead.")
+
+        def read(path: Path) -> Any:
+            return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+        team = cls(run, **kwargs)
+        team.manifest = from_dict(Manifest, read(run.manifest))
+        team.store = Store.open_sealed(run.db)
+        team.profile = from_dict(DatasetProfile, read(run.profile))
+        team.layout = from_dict(Layout, read(run.layout))
+        state = read(run.state) or {}
+
+        latest = contract_from_json(read(run.contract_latest)) if run.contract_latest.exists() else None
+        team.draft = contract_from_json(state["draft"]) if state.get("draft") else propose_contract(
+            team.store, team.profile, team.layout, team.manifest.dataset_hash)
+        team.contract = contract_from_json(state["contract"]) if state.get("contract") else (latest or team.draft)
+        for key in ("review", "feature_review", "model_review"):
+            if state.get(key):
+                setattr(team, key, from_dict(Review, state[key]))
+        team.features = [from_dict(Feature, f) for f in state.get("features") or []]
+        team.candidates = [from_dict(Candidate, c) for c in state.get("candidates") or []]
+        team.feedback = list(state.get("feedback") or [])
+
+        saved = dict(state.get("status") or {})
+        status = {key: saved.get(key, "pending") for key, _ in STAGES}
+        if not saved:  # an older run without a checkpoint: work it out from what was approved
+            status.update({k: "done" for k in ("intake", "load", "profile", "draft")})
+            status["gate"] = "done" if latest else "waiting"
+            if run.features_latest.exists():
+                status["feature_gate"] = "done"
+            if run.model_latest.exists():
+                status["model_gate"] = "done"
+        # Anything cut off mid-stage is not done: the run restarts from the last gate.
+        status = {k: ("pending" if v == "running" else v) for k, v in status.items()}
+        if status.get("gate") != "done":
+            status["gate"] = "waiting"
+        team.status = status
+
+        if status.get("gate") == "done" and latest is not None:
+            team.contract = latest if latest.version >= (team.contract.version or 0) else team.contract
+        if run.features_latest.exists() and status.get("feature_gate") == "done":
+            team.feature_set = from_dict(FeatureSet, read(run.features_latest))
+            if not team.features:
+                team.features = list(team.feature_set.features)
+        if status.get("gate") == "done":
+            if run.insights.exists():
+                team.insights = from_dict(DataInsights, read(run.insights))
+            if run.feature_tests.exists() and status.get("feature_tests") == "done":
+                team.feature_tests = from_dict(FeatureTestRun, read(run.feature_tests))
+        if status.get("feature_gate") == "done" and status.get("train") == "done" and run.training.exists():
+            team.training = from_dict(TrainingRun, read(run.training))
+            if run.tuning.exists():
+                team.tuning = from_dict(TuneRun, read(run.tuning))
+            if status.get("model_gate") != "done":
+                status["model_gate"] = "waiting"
+        elif status.get("feature_gate") == "done":
+            for stage in TRAIN_STAGES:
+                status[stage] = "pending"
+        if status.get("model_gate") == "done" and run.model_latest.exists():
+            team.model_card = read(run.model_latest)
+            report = run.root / "report.html"
+            team.report_path = report if report.exists() else None
+        if status.get("gate") == "done" and status.get("feature_gate") != "done" and not team.features:
+            for stage in FEATURE_STAGES:
+                status[stage] = "pending"  # features were never shown: build them again
+        team._trace.log("resume", status=status)
+        team.emit(TeamEvent("note", stage="intake", text=f"Resumed run {run.run_id} at: {team.where()}"))
+        return team
+
+    def where(self) -> str:
+        """The next thing waiting on someone, in plain words."""
+        s = self.status
+        if s.get("gate") != "done":
+            return "the data contract, waiting for your approval"
+        if s.get("feature_gate") == "waiting":
+            return "the features, waiting for your approval"
+        if s.get("feature_gate") != "done":
+            return "building features (approved contract)"
+        if s.get("model_gate") == "waiting":
+            return "the models, waiting for your approval"
+        if s.get("model_gate") != "done":
+            return "training (approved features)"
+        return "an approved model, ready to score and serve"
+
+    # -- feedback --------------------------------------------------------
+
+    def _note_feedback(self, stage: str, text: str | None) -> str:
+        """Record what the person said and return it as a block for the agent's prompt."""
+        text = (text or "").strip()
+        if not text:
+            return ""
+        self.feedback.append({"stage": stage, "text": text, "at": now_iso()})
+        self._trace.log("feedback", stage=stage, text=text)
+        self.emit(TeamEvent("note", stage=stage, text=f"Your feedback: {text}"))
+        if self.brain is None:
+            self.emit(TeamEvent("note", stage=stage, text=(
+                "No model is connected, so the rules run again unchanged; the feedback is saved with the run.")))
+        return feedback_block(text)
+
+    async def redo(self, step: str, feedback: str) -> object:
+        """Send feedback to the agents of one step and run that step again.
+        ``step``: contract, features or models. Later steps reset, as with any change."""
+        if step == "contract":
+            return await self.consult(feedback=feedback)
+        if step == "features":
+            return await self.build_features(feedback=feedback)
+        if step == "models":
+            return await self.train_models(feedback=feedback)
+        raise ValueError("Feedback goes to one of: contract, features, models.")
 
     # -- stages ----------------------------------------------------------
 
@@ -216,10 +364,12 @@ class Team:
             stats_only=self.stats_only,
         )
 
-    async def consult(self) -> None:
+    async def consult(self, feedback: str | None = None) -> None:
         """Analyst refines the draft, then the Skeptic reviews the result once.
         Without a connected model both are skipped and the rule-based draft
-        goes straight to the gate."""
+        goes straight to the gate. With feedback, the Analyst starts from the
+        current proposal and is told what the person wants changed."""
+        said = self._note_feedback("analyst", feedback)
         if self.brain is None:
             reason = self.brain_note or "No model connected."
             self._set("analyst", "skipped", reason)
@@ -227,6 +377,8 @@ class Team:
             self._set("gate", "waiting")
             return
         ctx = self._context()
+        if said and self.contract is not None:
+            ctx.draft = self.contract  # build on what the person already saw
         note = STATS_ONLY_NOTE if self.stats_only else ""
 
         self._set("analyst", "running", self.brain.label)
@@ -235,7 +387,7 @@ class Team:
             error = await run_role(
                 name="Analyst", stage="analyst", brain=self.brain,
                 system=ANALYST_SYSTEM + note, tools=analyst_tools(ctx),
-                prompt=analyst_prompt(ctx, draft_issues), emit=self.emit,
+                prompt=analyst_prompt(ctx, draft_issues) + said, emit=self.emit,
                 submitted=lambda: ctx.proposed is not None,
             )
         except Exception as exc:  # noqa: BLE001 - an agent failure must not kill the run
@@ -253,7 +405,7 @@ class Team:
             error = await run_role(
                 name="Skeptic", stage="skeptic", brain=self.brain,
                 system=SKEPTIC_SYSTEM + note, tools=skeptic_tools(ctx),
-                prompt=skeptic_prompt(contract, issues, ctx), emit=self.emit,
+                prompt=skeptic_prompt(contract, issues, ctx) + said, emit=self.emit,
                 submitted=lambda: ctx.review is not None,
             )
         except Exception as exc:  # noqa: BLE001
@@ -286,7 +438,8 @@ class Team:
         hint = horizon_from_answers(contract)
         if hint is not None and contract.horizon_days is None and contract.joins and contract.time_column:
             contract.horizon_days = hint
-            contract.rationale["horizon"] = f"Set from your answer: the prediction is made {hint} days after "                                             f"{contract.time_column}."
+            contract.rationale["horizon"] = (f"Set from your answer: the prediction is made {hint} days after "
+                                             f"{contract.time_column}.")
         path = save_contract(self.run, contract, approved_by)
         self.contract = contract
         self._trace.log(
@@ -308,13 +461,14 @@ class Team:
 
     # -- features --------------------------------------------------------
 
-    async def build_features(self) -> list[Feature]:
+    async def build_features(self, feedback: str | None = None) -> list[Feature]:
         """Rule-based features, then the Engineer's changes, then one Skeptic
         review. Needs an approved contract; a new approval means a rebuild."""
         contract = self.contract
         if contract is None or not contract.version or self.status.get("gate") != "done":
             raise ValueError("Approve the data contract first.")
         assert self.store and self.profile
+        said = self._note_feedback("engineer", feedback)
         for stage in FEATURE_STAGES:
             self.status[stage] = "pending"
         self.features, self.feature_review, self.feature_set = [], None, None
@@ -349,7 +503,7 @@ class Team:
             error = await run_role(
                 name="Engineer", stage="engineer", brain=self.brain,
                 system=ENGINEER_SYSTEM + note, tools=engineer_tools(ctx),
-                prompt=engineer_prompt(ctx), emit=self.emit, max_turns=20,
+                prompt=engineer_prompt(ctx) + said, emit=self.emit, max_turns=20,
                 submitted=lambda: ctx.engineered,
             )
         except Exception as exc:  # noqa: BLE001 - an agent failure must not kill the run
@@ -367,7 +521,7 @@ class Team:
             error = await run_role(
                 name="Skeptic", stage="feature_skeptic", brain=self.brain,
                 system=FEATURE_SKEPTIC_SYSTEM + note, tools=feature_skeptic_tools(ctx),
-                prompt=feature_skeptic_prompt(ctx), emit=self.emit,
+                prompt=feature_skeptic_prompt(ctx) + said, emit=self.emit,
                 submitted=lambda: ctx.feature_review is not None,
             )
         except Exception as exc:  # noqa: BLE001
@@ -485,13 +639,14 @@ class Team:
         by_name = {f.name: f for f in self.feature_set.features}
         return [by_name[n] for n in self.feature_set.selected if n in by_name]
 
-    async def train_models(self) -> TrainingRun:
+    async def train_models(self, feedback: str | None = None) -> TrainingRun:
         """Plan, then train and score every candidate in the harness, then one
         Skeptic review. Needs approved features."""
         if self.feature_set is None or self.status.get("feature_gate") != "done":
             raise ValueError("Approve the features first.")
         assert self.store and self.contract and self.profile
         contract, features = self.contract, self._selected_features()
+        said = self._note_feedback("train_plan", feedback)
         for stage in TRAIN_STAGES:
             self.status[stage] = "pending"
         self.training, self.model_review, self.model_card = None, None, None
@@ -518,7 +673,7 @@ class Team:
                 error = await run_role(
                     name="Engineer", stage="train_plan", brain=self.brain,
                     system=TRAINER_SYSTEM + note, tools=trainer_tools(ctx),
-                    prompt=trainer_prompt(ctx, shape), emit=self.emit,
+                    prompt=trainer_prompt(ctx, shape) + said, emit=self.emit,
                     submitted=lambda: ctx.planned,
                 )
             except Exception as exc:  # noqa: BLE001 - an agent failure must not kill the run
@@ -556,7 +711,7 @@ class Team:
                 error = await run_role(
                     name="Skeptic", stage="model_skeptic", brain=self.brain,
                     system=MODEL_SKEPTIC_SYSTEM + note, tools=model_skeptic_tools(ctx),
-                    prompt=model_skeptic_prompt(ctx), emit=self.emit,
+                    prompt=model_skeptic_prompt(ctx) + said, emit=self.emit,
                     submitted=lambda: ctx.model_review is not None,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -805,3 +960,10 @@ def _delivery(result) -> dict[str, object]:
     if ev.get("half_width") is not None:
         out["half_width"] = float(ev["half_width"])
     return out
+
+
+def feedback_block(text: str) -> str:
+    """The person's feedback, as it is handed to an agent."""
+    return ("\n\nFEEDBACK FROM THE PERSON who reviewed the last attempt at this step. Act on it; where you "
+            "cannot or should not (it would leak the answer, or break a rule), say so in your submission:\n"
+            + text.strip())

@@ -80,9 +80,14 @@ versioning, a person in the loop at the critical steps, and evals that cannot be
 - **Grouped splits** so the same customer is never in both training and test
 - A self-contained **HTML results report** for the person who asked the question
 
+**Steering the team**
+- **Feedback and redo**: tell the agents what to change at any gate ("also try a ratio of visits to tickets", "skip the linear model") and that step runs again with your note; every note is versioned and shown in the report
+- **Pause and resume**: close the app at any gate and pick the run up later, exactly where it stopped
+
 **After launch**
+- **Serve** the approved model over HTTP: `POST /predict` with JSON rows, same cut-off, rescaling and range as approved
 - Score new files with a **drift check** (PSI, corrected for chance) and a plain verdict: stable / watch / retrain
-- **Champion vs challenger**: retrain on new labelled rows, compare fairly, promote only if not worse
+- **Champion vs challenger**: retrain on new labelled rows, compare fairly, promote only if not worse (a promoted model is served at once, no restart)
 
 ## How it works
 
@@ -103,7 +108,11 @@ flowchart LR
     H --> S3[Skeptic reviews]
     S3 --> G3{{You: approve model}}
     G3 --> R[Results report and predictions]
-    R --> M[Monitor drift and retrain]
+    R --> V[Serve: POST /predict]
+    V --> M[Monitor drift and retrain]
+    G1 -. feedback .-> C
+    G2 -. feedback .-> F
+    G3 -. feedback .-> P
 ```
 
 ### A look inside
@@ -250,6 +259,46 @@ Useful options:
 | `--tune-seconds 60` | Time budget for tuning |
 | `--stats-only` | Agents see statistics only, never raw rows |
 
+### Steering: feedback, pause and resume
+
+Every gate tab has a feedback box. Write what you want changed and press Enter: that
+step's agents get your note, start from what you already saw, and run the step again.
+Later steps reset, as with any change. Headless, the same works once per step:
+
+```bash
+uv run python -m mlteam data.csv --headless --approve --redo-features "add visits per ticket"
+```
+
+Close the app whenever you like. Each run saves where it stands at every gate, so you
+can pick it up later. A step that was cut off mid-way starts again from the gate
+before it.
+
+```bash
+uv run python -m mlteam resume latest                    # open the app where it stopped
+```
+
+```bash
+uv run python -m mlteam resume latest --headless --approve-features --approve-model
+```
+
+### Serving the model
+
+```bash
+uv run python -m mlteam serve latest --port 8000
+```
+
+```bash
+curl -X POST http://127.0.0.1:8000/predict -H "Content-Type: application/json" -d '{"rows": [{"age": 41, "segment": "enterprise", "visits_30d": 9}]}'
+```
+
+The answer has a prediction per row, in the order sent, plus notes such as values the
+model has never seen. `GET /model` shows what is being served and `GET /health`
+checks it is up. Every request is scored exactly like `mlteam predict` and recorded as
+a batch, so live traffic shows up in `mlteam monitor` (drift is judged once batches
+have 30 rows or more). `mlteam promote` switches the served model without a restart.
+It listens on this machine only and has no authentication: put it behind a proxy that
+has some before exposing it.
+
 ### After launch
 
 ```bash
@@ -317,6 +366,8 @@ src/mlteam/
 ├── predict.py        scoring the test file and new files
 ├── monitor.py        drift (PSI) and health verdicts
 ├── challenger.py     champion vs challenger, promotion
+├── serve.py          the HTTP endpoint for the approved model
+├── restore.py        rebuilding saved runs, for resume
 ├── team.py           the harness: stages, gates, events, versions
 ├── agents/           Analyst, Engineer, Skeptic: prompts and tools
 ├── tui/              the Textual app and its renderers
@@ -341,7 +392,8 @@ and no network. A full run takes about 12 minutes; most of it is real model trai
 - Joins go one hop from the main table.
 - Gradient boosting is scikit-learn's histogram boosting (the LightGBM algorithm), not
   LightGBM or XGBoost themselves.
-- Serving predictions over a network is not built; scoring is file-in, file-out.
+- The server is a small standard-library one: fine for a team or a demo, not for heavy
+  traffic, and it has no authentication of its own.
 - Agents vary from run to run. The gates, the harness checks and the trace are what
   keep that safe.
 
@@ -351,6 +403,7 @@ The full list, with reasons, is in [docs/GUIDE.md](docs/GUIDE.md#limits-so-far).
 
 - Agent evals: known-answer datasets and a scorecard per prompt version
 - Benchmarks: OpenML-CC18 / AutoML Benchmark tasks with their official splits
+- A model per role (a cheaper one for reviews), and your own list of models to try
 - A guided "learn" mode that walks through each decision
 - Forecasting and text features
 

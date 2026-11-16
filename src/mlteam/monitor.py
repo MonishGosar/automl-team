@@ -152,6 +152,9 @@ def build_reference(
 # ---------------------------------------------------------------------------
 
 
+MIN_DRIFT_ROWS = 30  # below this, a drift verdict is noise
+
+
 def level(value: float) -> str:
     return "stable" if value < STABLE else "watch" if value < WATCH else "shifted"
 
@@ -176,6 +179,14 @@ def assess(
     score_dropped: bool = False,
 ) -> Health:
     health = Health(status="stable")
+    if matrix.shape[0] < MIN_DRIFT_ROWS:
+        # A handful of rows (one API call, say) cannot show drift: any verdict would be noise.
+        health.status = "too few rows"
+        health.small_batch = True
+        health.reasons.append(
+            f"{matrix.shape[0]} row(s) is too few to judge drift (at least {MIN_DRIFT_ROWS} needed). "
+            "Each batch is still recorded; `mlteam monitor` shows the trend over many.")
+        return health
     ref_rows = int(reference.get("rows") or 0)
     excess: dict[str, float] = {}
     noises: list[float] = []
@@ -243,6 +254,7 @@ ADVICE = {
     "stable": "Stable. Inputs and predictions look like the training data.",
     "watch": "Watch. Something is moving; keep scoring and check again.",
     "retrain": "Retrain recommended.",
+    "too few rows": "Too few rows to judge drift.",
 }
 
 
